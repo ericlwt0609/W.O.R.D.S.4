@@ -7,27 +7,67 @@ from docx import Document
 from docx import Document as DocxWriter
 import requests
 from bs4 import BeautifulSoup
+import re # For regex to highlight figures
 
-# Extract PDF text
+# Libraries for Excel and PowerPoint
+try:
+    import openpyxl
+except ImportError:
+    st.warning("openpyxl not found. Please install it: pip install openpyxl")
+try:
+    from pptx import Presentation
+except ImportError:
+    st.warning("python-pptx not found. Please install it: pip install python-pptx")
+
+# --- Text Extraction Functions ---
 def extract_pdf_text(file):
-    reader = PdfReader(file)
-    return "".join(page.extract_text() or "" for page in reader.pages)[:8000]
+    """Extracts text from a PDF file."""
+    try:
+        reader = PdfReader(file)
+        return "".join(page.extract_text() or "" for page in reader.pages)[:8000]
+    except Exception as e:
+        return f"[Error extracting PDF text: {e}]"
 
-# Extract DOCX text
 def extract_docx_text(file):
-    doc = Document(file)
-    return "\n".join(para.text for para in doc.paragraphs)[:8000]
+    """Extracts text from a DOCX file."""
+    try:
+        doc = Document(file)
+        return "\n".join(para.text for para in doc.paragraphs)[:8000]
+    except Exception as e:
+        return f"[Error extracting DOCX text: {e}]"
 
-# Fetch example SoW clauses from LawInsider
-def fetch_lawinsider_examples():
-    url = "https://www.lawinsider.com/clause/scope-of-work"
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, "html.parser")
-    clauses = soup.select(".clause-body")
-    return [clause.get_text(strip=True) for clause in clauses[:5]]
+def extract_excel_text(file):
+    """Extracts text from an XLSX file (all sheets)."""
+    try:
+        workbook = openpyxl.load_workbook(file)
+        full_text = []
+        for sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+            full_text.append(f"--- Sheet: {sheet_name} ---")
+            for row in sheet.iter_rows():
+                row_values = [str(cell.value) if cell.value is not None else "" for cell in row]
+                full_text.append("\t".join(row_values))
+        return "\n".join(full_text)[:8000]
+    except Exception as e:
+        return f"[Error extracting XLSX text: {e}]"
 
-# Scrape clauses from a custom URL
+def extract_ppt_text(file):
+    """Extracts text from a PPTX file (all slides)."""
+    try:
+        prs = Presentation(file)
+        full_text = []
+        for i, slide in enumerate(prs.slides):
+            full_text.append(f"--- Slide {i+1} ---")
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    full_text.append(shape.text)
+        return "\n".join(full_text)[:8000]
+    except Exception as e:
+        return f"[Error extracting PPTX text: {e}]"
+
+# --- Web Scraping Functions (Internal, not exposed in UI) ---
 def fetch_text_from_url(url):
+    """Scrapes paragraphs from a given URL."""
     try:
         response = requests.get(url)
         soup = BeautifulSoup(response.text, "html.parser")
@@ -36,17 +76,91 @@ def fetch_text_from_url(url):
     except Exception as e:
         return f"[Error fetching URL content: {e}]"
 
-# Generate SoW using OpenAI
-def generate_sow(base_text, user_desc, selected_examples, existing_sow=None, feedback=None):
-    examples_text = "\n---\n".join(selected_examples) if selected_examples else "None included"
+def fetch_legal_examples(query_term):
+    """
+    Fetches legal examples from various online sources using Google Search.
+    This function is internal and its sources are not mentioned in the UI.
+    """
+    all_snippets = []
+
+    # Search for EDGAR filings
+    edgar_query = f"site:sec.gov/Archives/edgar/data {query_term} agreement"
+    edgar_results = Google Search(queries=[edgar_query])
+    if edgar_results and edgar_results[0].results:
+        all_snippets.extend([r.snippet for r in edgar_results[0].results if r.snippet])
+
+    # Search for Law Firm website content
+    lawfirm_query = f"site:.com law firm {query_term} contract clauses OR template"
+    lawfirm_results = Google Search(queries=[lawfirm_query])
+    if lawfirm_results and lawfirm_results[0].results:
+        all_snippets.extend([r.snippet for r in lawfirm_results[0].results if r.snippet])
+
+    # Fetch from LawInsider (direct scrape as it's a known structure)
+    try:
+        lawinsider_url = "https://www.lawinsider.com/clause/scope-of-work"
+        response = requests.get(lawinsider_url)
+        soup = BeautifulSoup(response.text, "html.parser")
+        clauses = soup.select(".clause-body")
+        all_snippets.extend([clause.get_text(strip=True) for clause in clauses[:5]])
+    except Exception as e:
+        print(f"Error fetching from LawInsider: {e}")
+
+    # Search wider internet for similar agreements
+    general_query = f"'{query_term}' agreement examples OR template OR clauses"
+    general_results = Google Search(queries=[general_query])
+    if general_results and general_results[0].results:
+        all_snippets.extend([r.snippet for r in general_results[0].results if r.snippet])
+
+    return "\n---\n".join(all_snippets[:10]) # Limit to top 10 snippets for prompt size
+
+# --- LLM Interaction Function ---
+def generate_sow(base_text, user_desc, role_preference, combined_examples, existing_sow=None, feedback=None, additional_context=""):
+    """
+    Generates or refines a Scope of Work (SoW) using an LLM.
+    Adjusts content based on role preference (pro-vendor/pro-client).
+    """
+    # Define roles for the LLM prompt
+    if role_preference == "Company as Service Provider (Pro-Vendor)":
+        company_role = "Service Provider"
+        client_role = "Company"
+        dependencies_guidance = "The dependencies to be provided by the Company (client) should be extensive and clearly defined. Obligations of the Service Provider (your company) should be more generic and high-level."
+    else: # Company as Service Recipient (Pro-Client)
+        company_role = "Company"
+        client_role = "Service Provider" # In this case, the 'Service Provider' is the external entity
+        dependencies_guidance = "The dependencies to be provided by the Company (client) should be basic and minimal. Obligations of the Service Provider (the external entity) should be detailed and specific."
+
+    examples_text = "\n---\n".join(combined_examples) if combined_examples else "None included"
+
+    # Base prompt structure for initial generation or refinement
+    base_prompt_template = f"""
+You are a legal AI assistant specializing in contract drafting. Your task is to generate a comprehensive Scope of Work (SoW) document.
+
+The Company in this SoW refers to the entity that is the {'service provider' if role_preference == 'Company as Service Provider (Pro-Vendor)' else 'service recipient'}.
+The Service Provider in this SoW refers to the external entity that is the {'service recipient' if role_preference == 'Company as Service Provider (Pro-Vendor)' else 'service provider'}.
+
+{dependencies_guidance}
+
+Highlight all figures (numbers, percentages, currency amounts) by wrapping them in <span style='background-color: yellow; padding: 2px 4px; border-radius: 3px;'>[FIGURE: X]</span> tags to indicate they require independent validation. For example, a price of $10,000 should be <span style='background-color: yellow; padding: 2px 4px; border-radius: 3px;'>[FIGURE: $10,000]</span>.
+
+The SoW should follow this exact structure:
+
+1. Description – What is being supplied or done.
+2. Function – The business purpose or outcome the goods/services serve.
+3. Price – Pricing structure, billing frequency, and payment terms.
+4. Dependencies for the service to be provided by the Company/client.
+5. Milestones – Key deliverables with corresponding deadlines or phases.
+6. Warranties – Any performance guarantees, service warranties, or coverage periods.
+7. Service Levels (if applicable) – SLAs, KPIs, uptime, penalties, or escalation paths.
+8. Others – Any additional relevant clauses not captured above (e.g. assumptions, subcontracting, ownership of deliverables).
+"""
 
     if existing_sow and feedback:
-        # If refining an existing SoW
-        prompt = f'''
-You are a legal AI assistant. Based on the existing Statement of Work and the user's feedback, generate an improved version of the SoW. Retain all parts that have not been highlighted or are not relevant to the changes requested in the feedback.
+        # Refinement prompt
+        prompt = f"""
+{base_prompt_template}
 
 ---
-Existing Statement of Work:
+Existing Scope of Work:
 {existing_sow}
 
 ---
@@ -54,180 +168,180 @@ User Feedback for Refinement:
 {feedback}
 
 ---
-Generate the improved SoW using the original structure:
-1. Description – What is being supplied or done.
-2. Function – The business purpose or outcome the goods/services serve.
-3. Price – Pricing structure, billing frequency, and payment terms.
-4. Milestones – Key deliverables with corresponding deadlines or phases.
-5. Warranties – Any performance guarantees, service warranties, or coverage periods.
-6. Service Levels (if applicable) – SLAs, KPIs, uptime, penalties, or escalation paths.
-7. Others – Any additional relevant clauses not captured above (e.g. assumptions, subcontracting, ownership of deliverables).
-'''
+Based on the existing Scope of Work and the user's feedback, provide an updated version of the SoW. Retain all parts that have not been highlighted or are not relevant to the changes requested in the feedback. Ensure the updated SoW still adheres to the specified structure and highlighting rules.
+"""
     else:
-        # Initial generation
-        prompt = f'''
-You are a legal AI assistant. Based on the following base contract text, user description, and example SoW clauses, generate a detailed Statement of Work (SoW). You should also search the Internet for any information or SoW which are the same or similar as the subject in question and incorporate relevant information from there.
+        # Initial generation prompt
+        prompt = f"""
+{base_prompt_template}
 
 ---
-User Description:
+User Description of Goods/Services and Business Context:
 {user_desc}
 
 ---
-Base Document Extract:
+Base Document Extract (from uploaded files):
 {base_text}
 
 ---
-Example SoWs:
+User-Provided and Automatically Fetched Example SoW Clauses:
 {examples_text}
 
 ---
-Generate the SoW using the following structure:
+Additional Context from Public Filings and Legal Resources:
+{additional_context if additional_context else "No additional relevant context found."}
 
-1. Description – What is being supplied or done.
-2. Function – The business purpose or outcome the goods/services serve.
-3. Price – Pricing structure, billing frequency, and payment terms.
-4. Milestones – Key deliverables with corresponding deadlines or phases.
-5. Warranties – Any performance guarantees, service warranties, or coverage periods.
-6. Service Levels (if applicable) – SLAs, KPIs, uptime, penalties, or escalation paths.
-7. Others – Any additional relevant clauses not captured above (e.g. assumptions, subcontracting, ownership of deliverables).
-
-Also suggest questions for missing or unclear details.
-'''
+---
+Generate a detailed Scope of Work (SoW) based on the provided information, adhering to the structure, role definitions, and highlighting rules. Also, suggest questions for missing or unclear details at the end of the generated SoW.
+"""
 
     client = openai.OpenAI(base_url="https://generativelanguage.googleapis.com/v1beta/openai/", api_key=os.getenv("OPENAI_API_KEY"))
 
     response = client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash", # Using gemini-2.5-flash as requested by the prompt
         messages=[
-            {"role": "system", "content": "You are a contract lawyer."},
+            {"role": "system", "content": "You are a legal AI assistant specializing in contract drafting."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.5
+        temperature=0.7 # Increased temperature slightly for more creative generation
     )
     return response.choices[0].message.content
 
-# Export output to DOCX
-def export_to_docx(content):
+# --- DOCX Export Function ---
+def export_to_docx(content, file_name="Scope_of_Work.docx"):
+    """Exports the given content to a DOCX file."""
     doc = DocxWriter()
-    doc.add_heading("Generated Statement of Work", level=1)
-    for paragraph in content.split('\n'):
+    doc.add_heading("Generated Scope of Work", level=1)
+    # Remove the HTML highlighting tags before exporting to DOCX
+    clean_content = re.sub(r"<span style='background-color: yellow;[^>]*?>\[FIGURE: (.*?)\]</span>", r"\1", content)
+    for paragraph in clean_content.split('\n'):
         doc.add_paragraph(paragraph)
     temp_path = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
     doc.save(temp_path.name)
     return temp_path.name
 
-# Streamlit UI
-st.title("AI Statement of Work (SoW) Generator")
+# --- Streamlit UI ---
+st.title("AI Scope of Work (SoW) Generator")
 
-uploaded_file = st.file_uploader("Upload all relevant/to-date client presentation, proposal, scope document and even base contracts which you wish this to be based on (PDF or DOCX)", type=["pdf", "docx"])
+# Document Upload Section
+uploaded_file = st.file_uploader(
+    "Upload all relevant/to-date client presentations, proposals, scope documents, and even base contracts (PDF, DOCX, XLSX, PPTX)",
+    type=["pdf", "docx", "xlsx", "pptx"]
+)
 user_desc = st.text_area("Describe the goods/services and business context")
 
-# LawInsider examples are now always included
-with st.spinner("Fetching LawInsider examples..."):
-    lawinsider_examples = fetch_lawinsider_examples()
+# Role Selection
+role_preference = st.radio(
+    "Generate SoW for your Company as:",
+    ("Company as Service Provider (Pro-Vendor)", "Company as Service Recipient (Pro-Client)")
+)
 
+# Reinstated sections for custom input
 custom_examples_input = st.text_area("Paste your own SoW clauses or content here (optional)")
 external_url = st.text_input("Paste a URL to extract external SoW-style clauses (optional)")
 
+
 if st.button("Generate SoW"):
     if uploaded_file and user_desc:
-        with st.spinner("Extracting text and generating SoW..."):
+        with st.spinner("Extracting text and gathering legal context..."):
             # Extract uploaded content
-            if uploaded_file.name.endswith(".pdf"):
-                text = extract_pdf_text(uploaded_file)
+            file_extension = uploaded_file.name.split(".")[-1].lower()
+            base_text = ""
+            if file_extension == "pdf":
+                base_text = extract_pdf_text(uploaded_file)
+            elif file_extension == "docx":
+                base_text = extract_docx_text(uploaded_file)
+            elif file_extension == "xlsx":
+                base_text = extract_excel_text(uploaded_file)
+            elif file_extension == "pptx":
+                base_text = extract_ppt_text(uploaded_file)
             else:
-                text = extract_docx_text(uploaded_file)
+                st.error("Unsupported file type.")
+                st.stop()
 
-            # Collect all examples, including LawInsider automatically
-            combined_examples = lawinsider_examples.copy()
+            # Collect all examples, including user-provided and URL-scraped
+            combined_examples = []
             if custom_examples_input.strip():
                 combined_examples.append(custom_examples_input.strip())
             if external_url.strip():
-                combined_examples.append(fetch_text_from_url(external_url.strip()))
+                # Fetch text from the URL and append
+                fetched_url_content = fetch_text_from_url(external_url.strip())
+                if fetched_url_content:
+                    combined_examples.append(fetched_url_content)
+
+            # Automatically comb through public documents and legal resources
+            additional_context = fetch_legal_examples(user_desc) # Use user_desc for better search relevance
 
             # Generate SoW
-            sow = generate_sow(text, user_desc, combined_examples)
+            generated_sow_content = generate_sow(
+                base_text,
+                user_desc,
+                role_preference,
+                combined_examples=combined_examples, # Pass combined examples here
+                additional_context=additional_context
+            )
 
             # Store the generated SoW in session state for refinement
-            st.session_state.generated_sow = sow
-            st.session_state.base_text = text
+            st.session_state.generated_sow = generated_sow_content
+            st.session_state.base_text = base_text
             st.session_state.user_desc = user_desc
-            st.session_state.combined_examples = combined_examples
+            st.session_state.role_preference = role_preference
+            st.session_state.combined_examples = combined_examples # Store for consistent refinement
+            st.session_state.additional_context = additional_context # Store context for consistent refinement
 
-            # Show result
-            st.subheader("Generated Statement of Work")
-            st.write(sow)
+            # Show result with highlighting
+            st.subheader("Generated Scope of Work")
+            st.markdown(generated_sow_content, unsafe_allow_html=True)
 
             # Offer download
-            docx_path = export_to_docx(sow)
+            docx_path = export_to_docx(generated_sow_content, "Generated_Scope_of_Work.docx")
             with open(docx_path, "rb") as f:
-                st.download_button("Download SoW as DOCX", f, file_name="Statement_of_Work.docx")
+                st.download_button("Download SoW as DOCX", f, file_name="Generated_Scope_of_Work.docx")
     else:
-        st.warning("Please upload a document and provide a description.")
+        st.warning("Please upload a document and provide a description to generate the SoW.")
 
-# Feedback section for refinement
+# Iterative Refinement Section
+st.markdown("---")
+st.subheader("Refine SoW")
+
 if 'generated_sow' in st.session_state and st.session_state.generated_sow:
-    st.markdown("---")
-    st.subheader("Refine Statement of Work")
-    feedback_input = st.text_area("What would you like to add, remove, or edit in the SoW?", key="feedback_sow")
+    # Display the current SoW in a disabled text area
+    st.text_area(
+        "Current Scope of Work (scroll to view full content)",
+        value=st.session_state.generated_sow,
+        height=400,
+        disabled=True,
+        key="current_sow_display"
+    )
 
-    if st.button("Refine SoW"):
+    feedback_input = st.text_area(
+        "Suggest a refinement (e.g., expand delivery details, adjust pricing terms, clarify dependencies):",
+        key="feedback_for_refinement"
+    )
+
+    if st.button("Apply Refinement"):
         if feedback_input.strip():
-            with st.spinner("Refining Statement of Work..."):
+            with st.spinner("Refining Scope of Work..."):
                 refined_sow = generate_sow(
                     st.session_state.base_text,
                     st.session_state.user_desc,
-                    st.session_state.combined_examples, # Pass existing examples for context
+                    st.session_state.role_preference,
+                    combined_examples=st.session_state.combined_examples, # Pass combined examples for context
                     existing_sow=st.session_state.generated_sow,
-                    feedback=feedback_input
+                    feedback=feedback_input,
+                    additional_context=st.session_state.additional_context # Pass context for consistency
                 )
-                st.session_state.generated_sow = refined_sow # Update the stored SoW
-                st.subheader("Refined Statement of Work")
-                st.write(refined_sow)
+                st.session_state.generated_sow = refined_sow # Update the stored SoW for next iteration
+
+                st.success("Scope of Work updated based on your refinement.")
+                st.subheader("Refined Scope of Work")
+                st.markdown(refined_sow, unsafe_allow_html=True) # Display with highlighting
 
                 # Offer download for refined SoW
-                docx_path = export_to_docx(refined_sow)
+                docx_path = export_to_docx(refined_sow, "Refined_Scope_of_Work.docx")
                 with open(docx_path, "rb") as f:
-                    st.download_button("Download Refined SoW as DOCX", f, file_name="Refined_Statement_of_Work.docx")
+                    st.download_button("Download Refined SoW as DOCX", f, file_name="Refined_Scope_of_Work.docx")
         else:
-            st.warning("Please provide feedback to refine the SoW.")
-
-st.header("✏️ Refine Your Statement of Work")
-
-if "sow_content" in st.session_state and st.session_state.sow_content:
-    st.text_area("Current SoW", value=st.session_state.sow_content, height=300, disabled=True)
-
-    feedback = st.text_area("Suggest a refinement (e.g., expand delivery details, adjust pricing terms):")
-
-    if st.button("Apply Refinement"):
-        if feedback.strip():
-            # Build prompt with context
-            prompt = f"""
-You are a contract lawyer AI. Based on the current Statement of Work (SoW) and the user’s refinement request, provide an updated version of the SoW.
-
-Current SoW:
-{st.session_state.sow_content}
-
-Refinement Request:
-{feedback.strip()}
-
-Please return the updated full SoW only.
-"""
-            client = openai.OpenAI()
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are a contract lawyer AI."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3
-            )
-
-            # Update session with new SoW
-            st.session_state.sow_content = response.choices[0].message.content
-            st.success("SoW updated based on your refinement.")
-        else:
-            st.warning("Please type a suggestion before clicking refine.")
+            st.warning("Please type a suggestion before clicking 'Apply Refinement'.")
 else:
-    st.info("No SoW to refine. Please generate one first.")
-
+    st.info("No Scope of Work to refine. Please generate one first.")
